@@ -1,15 +1,12 @@
-import * as cdk from 'aws-cdk-lib';
-import * as s3 from 'aws-cdk-lib/aws-s3';
-import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
-import * as statement from 'cdk-iam-floyd';
+import { aws_iam, aws_s3, aws_s3_deployment, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import fs = require('fs');
 import path = require('path');
 
 import { Document } from '../../lib';
 
-export class TestStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+export class TestStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
     let file = path.join(
       __dirname,
@@ -68,21 +65,23 @@ export class TestStack extends cdk.Stack {
      *
      * Requires a bucket to hold install/update/uninstall scripts.
      */
-    const bucketName = `${cdk.Stack.of(this).account}-cdk-ssm-document-storage`;
-    const bucket = new s3.Bucket(this, 'DistributorPackages', {
+    const bucketName = `${Stack.of(this).account}-cdk-ssm-document-storage`;
+    const bucket = new aws_s3.Bucket(this, 'DistributorPackages', {
       bucketName: bucketName,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      blockPublicAccess: aws_s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
-      encryption: s3.BucketEncryption.KMS_MANAGED,
+      encryption: aws_s3.BucketEncryption.KMS_MANAGED,
       // Makes for easy destroy and rerun of this stack over and over.
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
-    const packageDeploy = new s3deploy.BucketDeployment(
+    const packageDeploy = new aws_s3_deployment.BucketDeployment(
       this,
       'distribution-packages',
       {
-        sources: [s3deploy.Source.asset('../test/documents/distributor')],
+        sources: [
+          aws_s3_deployment.Source.asset('../test/documents/distributor'),
+        ],
         destinationBucket: bucket,
       }
     );
@@ -110,6 +109,86 @@ export class TestStack extends cdk.Stack {
       ...attachments,
     });
 
+    const docF = new Document(this, `SSM-Document-Automation-Inline`, {
+      documentType: 'Automation',
+      name: 'Test-Automation-Inline',
+      content: {
+        schemaVersion: '0.3',
+        assumeRole: "{{AutomationAssumeRole}}",
+        description: 'Echo Hello World!',
+        parameters: {
+          doSomething: {
+            type: "Boolean",
+            description: "Do something",
+            default: 'true'
+          },
+          AutomationAssumeRole: {
+            default: '',
+            description: '(Optional) The ARN of the role to run Automations on your behalf.',
+            type: 'String'
+          }
+        },
+        mainSteps: [
+          {
+            "name": "DoSomethingCheck",
+            "action": "aws:branch",
+            "inputs": {
+              "Choices": [
+                {
+                  "NextStep": "createImage1",
+                  "Variable": "{{ doSomething }}",
+                  "BooleanEquals": true
+                },
+                {
+                  "NextStep": "createImage2",
+                  "Variable": "{{ doSomething }}",
+                  "BooleanEquals": false
+                }
+              ]
+            }
+          },
+          {
+            "name": "createImage1",
+            "action": "aws:executeAwsApi",
+            "onFailure": "Abort",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "CreateImage",
+              "InstanceId": "i-1234567890",
+              "Name": "Image",
+              "NoReboot": false
+            },
+            "outputs": [
+              {
+                "Name": "newImageId",
+                "Selector": "$.ImageId",
+                "Type": "String"
+              }
+            ]
+          },
+          {
+            "name": "createImage2",
+            "action": "aws:executeAwsApi",
+            "onFailure": "Abort",
+            "inputs": {
+              "Service": "ec2",
+              "Api": "CreateImage",
+              "InstanceId": "i-0987654321",
+              "Name": "Image",
+              "NoReboot": false
+            },
+            "outputs": [
+              {
+                "Name": "newImageId",
+                "Selector": "$.ImageId",
+                "Type": "String"
+              }
+            ]
+          }
+        ]
+      }
+    })
+
     /**
      * The owner/creator of the document must have read access to the
      * s3 files that make up a distribution. Since that is the lambda in this
@@ -117,12 +196,13 @@ export class TestStack extends cdk.Stack {
      * `Active`.
      */
     docE.lambda.role?.addToPrincipalPolicy(
-      new statement.S3() //
-        .allow()
-        .toGetObject()
-        .onObject(bucket.bucketName, '*')
+      new aws_iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [`${bucket.arnForObjects('*')}`],
+      })
     );
 
+    docF.node.addDependency(docE);
     docE.node.addDependency(docD);
     docE.node.addDependency(packageDeploy);
     docD.node.addDependency(docC);
